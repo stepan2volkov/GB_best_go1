@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	netURL "net/url"
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,15 +29,19 @@ type Page interface {
 }
 
 type page struct {
-	doc *goquery.Document
+	doc     *goquery.Document
+	baseURL string
 }
 
-func NewPage(raw io.Reader) (Page, error) {
+func NewPage(url string, raw io.Reader) (Page, error) {
 	doc, err := goquery.NewDocumentFromReader(raw)
 	if err != nil {
 		return nil, err
 	}
-	return &page{doc: doc}, nil
+	// Для относительных ссылок
+	parsedBaseURL, _ := netURL.Parse(url)
+	baseURL := fmt.Sprintf("%s://%s", parsedBaseURL.Scheme, parsedBaseURL.Host)
+	return &page{doc: doc, baseURL: baseURL}, nil
 }
 
 func (p *page) GetTitle() string {
@@ -46,10 +53,38 @@ func (p *page) GetLinks() []string {
 	p.doc.Find("a").Each(func(_ int, s *goquery.Selection) {
 		url, ok := s.Attr("href")
 		if ok {
-			urls = append(urls, url)
+			newURL, err := p.makeLink(url)
+			if err != nil {
+				log.Printf(`crawler result: cannot generate link for: %s (err: %s)\n`, url, err.Error())
+				return
+			}
+			urls = append(urls, newURL)
 		}
 	})
 	return urls
+}
+
+func (p *page) makeLink(url string) (string, error) {
+	parsedURL, err := netURL.Parse(url)
+	if err != nil {
+		return "nil", err
+	}
+
+	if parsedURL.Host == "" {
+		return p.baseURL + url, nil
+	}
+
+	newURL := parsedURL.Host + parsedURL.Path
+	if parsedURL.RawQuery != "" {
+		newURL = fmt.Sprintf("%s?%s", newURL, parsedURL.RawQuery)
+	}
+	if parsedURL.Scheme == "" {
+		newURL = "https://" + newURL
+	} else {
+		newURL = fmt.Sprintf("%s://%s", parsedURL.Scheme, newURL)
+	}
+
+	return newURL, nil
 }
 
 type Requester interface {
@@ -81,18 +116,17 @@ func (r requester) Get(ctx context.Context, url string) (Page, error) {
 			return nil, err
 		}
 		defer body.Body.Close()
-		page, err := NewPage(body.Body)
+		page, err := NewPage(url, body.Body)
 		if err != nil {
 			return nil, err
 		}
 		return page, nil
 	}
-	return nil, nil
 }
 
 //Crawler - интерфейс (контракт) краулера
 type Crawler interface {
-	Scan(ctx context.Context, url string, depth int)
+	Scan(ctx context.Context, url string, depth uint64)
 	ChanResult() <-chan CrawlResult
 }
 
@@ -101,19 +135,21 @@ type crawler struct {
 	res     chan CrawlResult
 	visited map[string]struct{}
 	mu      sync.RWMutex
+	cfg     *Config
 }
 
-func NewCrawler(r Requester) *crawler {
+func NewCrawler(r Requester, cfg *Config) *crawler {
 	return &crawler{
 		r:       r,
 		res:     make(chan CrawlResult),
 		visited: make(map[string]struct{}),
 		mu:      sync.RWMutex{},
+		cfg:     cfg,
 	}
 }
 
-func (c *crawler) Scan(ctx context.Context, url string, depth int) {
-	if depth <= 0 { //Проверяем то, что есть запас по глубине
+func (c *crawler) Scan(ctx context.Context, url string, depth uint64) {
+	if depth > c.cfg.MaxDepth { //Проверяем то, что есть запас по глубине
 		return
 	}
 	c.mu.RLock()
@@ -122,6 +158,7 @@ func (c *crawler) Scan(ctx context.Context, url string, depth int) {
 	if ok {
 		return
 	}
+	log.Printf("Checking %s (depth %d/%d)", url, depth, c.cfg.MaxDepth)
 	select {
 	case <-ctx.Done(): //Если контекст завершен - прекращаем выполнение
 		return
@@ -139,7 +176,7 @@ func (c *crawler) Scan(ctx context.Context, url string, depth int) {
 			Url:   url,
 		}
 		for _, link := range page.GetLinks() {
-			go c.Scan(ctx, link, depth-1) //На все полученные ссылки запускаем новую рутину сборки
+			go c.Scan(ctx, link, depth+1) //На все полученные ссылки запускаем новую рутину сборки
 		}
 	}
 }
@@ -150,7 +187,7 @@ func (c *crawler) ChanResult() <-chan CrawlResult {
 
 //Config - структура для конфигурации
 type Config struct {
-	MaxDepth   int
+	MaxDepth   uint64
 	MaxResults int
 	MaxErrors  int
 	Url        string
@@ -160,30 +197,36 @@ type Config struct {
 func main() {
 
 	cfg := Config{
-		MaxDepth:   3,
-		MaxResults: 10,
-		MaxErrors:  5,
+		MaxDepth:   5,
+		MaxResults: 10000,
+		MaxErrors:  5000,
 		Url:        "https://telegram.org",
-		Timeout:    10,
+		Timeout:    100,
 	}
-	var cr Crawler
-	var r Requester
 
-	r = NewRequester(time.Duration(cfg.Timeout) * time.Second)
-	cr = NewCrawler(r)
+	var r Requester = NewRequester(time.Duration(cfg.Timeout) * time.Second)
+	var cr Crawler = NewCrawler(r, &cfg)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	go cr.Scan(ctx, cfg.Url, cfg.MaxDepth) //Запускаем краулер в отдельной рутине
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Timeout)*time.Second)
+	go cr.Scan(ctx, cfg.Url, 0)            //Запускаем краулер в отдельной рутине
 	go processResult(ctx, cancel, cr, cfg) //Обрабатываем результаты в отдельной рутине
 
-	sigCh := make(chan os.Signal)        //Создаем канал для приема сигналов
-	signal.Notify(sigCh, syscall.SIGINT) //Подписываемся на сигнал SIGINT
+	sigStopCh := make(chan os.Signal, 1)     //Создаем канал для приема сигнала завершения
+	signal.Notify(sigStopCh, syscall.SIGINT) //Подписываемся на сигнал SIGINT
+
+	sigCh := make(chan os.Signal, 1)      //Создаем канал для приема сигнала завершения
+	signal.Notify(sigCh, syscall.SIGUSR1) //Подписываемся на сигнал SIGINT
+
 	for {
 		select {
 		case <-ctx.Done(): //Если всё завершили - выходим
 			return
+		case <-sigStopCh:
+			log.Println("Gracefull shutdown started") // Приятно знать, что мы действительно обработали сигнал
+			cancel()                                  //Если пришёл сигнал SigInt - завершаем контекст
 		case <-sigCh:
-			cancel() //Если пришёл сигнал SigInt - завершаем контекст
+			log.Printf(`Max depth increased. Current value is "%d"\n`, cfg.MaxDepth)
+			atomic.AddUint64(&cfg.MaxDepth, 2)
 		}
 	}
 }
@@ -200,6 +243,7 @@ func processResult(ctx context.Context, cancel func(), cr Crawler, cfg Config) {
 				log.Printf("crawler result return err: %s\n", msg.Err.Error())
 				if maxErrors <= 0 {
 					cancel()
+					log.Println("Stopped because of max error limit.")
 					return
 				}
 			} else {
