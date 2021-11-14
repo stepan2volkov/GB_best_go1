@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"gopkg.in/yaml.v3"
 )
 
 type CrawlResult struct {
@@ -55,7 +58,7 @@ func (p *page) GetLinks() []string {
 		if ok {
 			newURL, err := p.makeLink(url)
 			if err != nil {
-				log.Printf(`crawler result: cannot generate link for: %s (err: %s)\n`, url, err.Error())
+				log.Printf(`crawler result: cannot generate link for: "%s" (err: "%s")\n`, url, err.Error())
 				return
 			}
 			urls = append(urls, newURL)
@@ -64,27 +67,23 @@ func (p *page) GetLinks() []string {
 	return urls
 }
 
+// makeLink creates absolute link if we've got a relative one
 func (p *page) makeLink(url string) (string, error) {
 	parsedURL, err := netURL.Parse(url)
 	if err != nil {
-		return "nil", err
+		return "", err
 	}
 
+	// Для относительных ссылок добавляем хост страницы, с которой взяли ссылку
 	if parsedURL.Host == "" {
 		return p.baseURL + url, nil
 	}
 
-	newURL := parsedURL.Host + parsedURL.Path
-	if parsedURL.RawQuery != "" {
-		newURL = fmt.Sprintf("%s?%s", newURL, parsedURL.RawQuery)
-	}
+	// Добавляем схему, если она не указана. Для ссылок вида "//core.telegram.org/api"
 	if parsedURL.Scheme == "" {
-		newURL = "https://" + newURL
-	} else {
-		newURL = fmt.Sprintf("%s://%s", parsedURL.Scheme, newURL)
+		return "https:" + url, nil
 	}
-
-	return newURL, nil
+	return url, nil
 }
 
 type Requester interface {
@@ -128,28 +127,33 @@ func (r requester) Get(ctx context.Context, url string) (Page, error) {
 type Crawler interface {
 	Scan(ctx context.Context, url string, depth uint64)
 	ChanResult() <-chan CrawlResult
+	IncreaseMaxDepth(delta uint64)
 }
 
 type crawler struct {
-	r       Requester
-	res     chan CrawlResult
-	visited map[string]struct{}
-	mu      sync.RWMutex
-	cfg     *Config
+	r        Requester
+	res      chan CrawlResult
+	visited  map[string]struct{}
+	mu       sync.RWMutex
+	maxDepth uint64
 }
 
-func NewCrawler(r Requester, cfg *Config) *crawler {
+func NewCrawler(r Requester, maxDepth uint64) *crawler {
 	return &crawler{
-		r:       r,
-		res:     make(chan CrawlResult),
-		visited: make(map[string]struct{}),
-		mu:      sync.RWMutex{},
-		cfg:     cfg,
+		r:        r,
+		res:      make(chan CrawlResult),
+		visited:  make(map[string]struct{}),
+		mu:       sync.RWMutex{},
+		maxDepth: maxDepth,
 	}
 }
 
+func (c *crawler) IncreaseMaxDepth(delta uint64) {
+	atomic.AddUint64(&c.maxDepth, delta)
+}
+
 func (c *crawler) Scan(ctx context.Context, url string, depth uint64) {
-	if depth > c.cfg.MaxDepth { //Проверяем то, что есть запас по глубине
+	if depth > c.maxDepth { //Проверяем то, что есть запас по глубине
 		return
 	}
 	c.mu.RLock()
@@ -158,7 +162,7 @@ func (c *crawler) Scan(ctx context.Context, url string, depth uint64) {
 	if ok {
 		return
 	}
-	log.Printf("Checking %s (depth %d/%d)", url, depth, c.cfg.MaxDepth)
+	log.Printf("Processing %s (%d/%d)", url, depth, c.maxDepth)
 	select {
 	case <-ctx.Done(): //Если контекст завершен - прекращаем выполнение
 		return
@@ -187,25 +191,33 @@ func (c *crawler) ChanResult() <-chan CrawlResult {
 
 //Config - структура для конфигурации
 type Config struct {
-	MaxDepth   uint64
-	MaxResults int
-	MaxErrors  int
-	Url        string
-	Timeout    int //in seconds
+	MaxDepth   uint64 `yaml:"max_depth"`
+	MaxResults int    `yaml:"max_results"`
+	MaxErrors  int    `yaml:"max_errors"`
+	Url        string `yaml:"url"`
+	Timeout    int    `yaml:"timeout"` //in seconds
+	Delta      uint64 `yaml:"delta"`
+	Output     string `yaml:"output"`
 }
 
 func main() {
+	configPath := flag.String("config", "config.yaml", "the config path")
+	flag.Parse()
 
-	cfg := Config{
-		MaxDepth:   5,
-		MaxResults: 10000,
-		MaxErrors:  5000,
-		Url:        "https://telegram.org",
-		Timeout:    100,
+	cfg := Config{}
+
+	configFile, err := os.ReadFile(*configPath)
+	if err != nil {
+		log.Fatalf(`error when opening config in "%s": %v`, *configPath, err)
+	}
+
+	err = yaml.Unmarshal(configFile, &cfg)
+	if err != nil {
+		log.Fatalf("error when reading config: %v", err)
 	}
 
 	var r Requester = NewRequester(time.Duration(cfg.Timeout) * time.Second)
-	var cr Crawler = NewCrawler(r, &cfg)
+	var cr Crawler = NewCrawler(r, cfg.MaxDepth)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Timeout)*time.Second)
 	go cr.Scan(ctx, cfg.Url, 0)            //Запускаем краулер в отдельной рутине
@@ -225,14 +237,35 @@ func main() {
 			log.Println("Gracefull shutdown started") // Приятно знать, что мы действительно обработали сигнал
 			cancel()                                  //Если пришёл сигнал SigInt - завершаем контекст
 		case <-sigCh:
-			log.Printf(`Max depth increased. Current value is "%d"\n`, cfg.MaxDepth)
-			atomic.AddUint64(&cfg.MaxDepth, 2)
+			cr.IncreaseMaxDepth(cfg.Delta)
+			log.Printf("Max depth increased")
 		}
 	}
 }
 
 func processResult(ctx context.Context, cancel func(), cr Crawler, cfg Config) {
 	var maxResult, maxErrors = cfg.MaxResults, cfg.MaxErrors
+
+	outputFile := os.Stdout
+	var err error
+
+	if cfg.Output != "" {
+		outputFile, err = os.Create(cfg.Output)
+		if err != nil {
+			log.Fatalf("error when openning csv-file: %v\n", err)
+		}
+	}
+	defer outputFile.Close()
+	csvWriter := csv.NewWriter(outputFile)
+
+	// Формируем заголовок
+	err = csvWriter.Write([]string{"URL", "Title"})
+	if err != nil {
+		log.Printf("error when writing csv header: %v\n", err)
+		return
+	}
+	defer csvWriter.Flush()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -243,12 +276,18 @@ func processResult(ctx context.Context, cancel func(), cr Crawler, cfg Config) {
 				log.Printf("crawler result return err: %s\n", msg.Err.Error())
 				if maxErrors <= 0 {
 					cancel()
-					log.Println("Stopped because of max error limit.")
+					log.Println("Stopped because of max error limit exceeded")
 					return
 				}
 			} else {
 				maxResult--
-				log.Printf("crawler result: [url: %s] Title: %s\n", msg.Url, msg.Title)
+				err := csvWriter.Write([]string{msg.Url, msg.Title})
+				if err != nil {
+					log.Println("Stopped because of error when ")
+					return
+				}
+
+				// log.Printf("crawler result: [url: %s] Title: %s\n", msg.Url, msg.Title)
 				if maxResult <= 0 {
 					cancel()
 					return
