@@ -1,0 +1,7 @@
+max_depth: 5
+max_results: 10000
+max_errors: 5000
+url: "https://telegram.org"
+timeout: 100
+delta: 2
+output: "output.csv"
