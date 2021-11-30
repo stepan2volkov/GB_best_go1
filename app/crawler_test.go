@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -34,20 +34,11 @@ const (
 		</html>`
 )
 
-func TestPage(t *testing.T) {
-	doc := strings.NewReader(mainPage)
-	testPage, err := NewPage(mainPageUrl, doc)
-	assert.Equal(t, nil, err, "unexpected error when creating page")
-	assert.Equal(t, "Telegram Title", testPage.GetTitle())
-	assert.Equal(t, []string{firstPageUrl, secondPageUrl}, testPage.GetLinks())
-}
 
 func TestCrawler(t *testing.T) {
 	ctx, _ := context.WithTimeout(context.Background(), time.Duration(100)*time.Millisecond)
 	mc := minimock.NewController(t)
 
-	//mainDoc := strings.NewReader(mainPage)
-	//mainPage, err := NewPage(mainPageUrl, doc)
 
 	pages := map[string]string{
 		mainPageUrl:   mainPage,
@@ -75,7 +66,7 @@ func TestCrawler(t *testing.T) {
 	results := cr.ChanResult()
 	visited := map[CrawlResult]struct{}{}
 
-	STOP:
+STOP:
 	for {
 		select {
 		case <-ctx.Done():
