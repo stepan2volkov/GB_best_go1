@@ -98,6 +98,10 @@ func NewRequester(timeout time.Duration) requester {
 	return requester{timeout: timeout}
 }
 
+// Можно протестировать, если вынести http.Client и http.NewRequest в отдельную структуру и
+// закрыться от неё интерфейсом.
+// Но в этом случае здесь почти не остаётся логики, кроме отмены контекста и оборачивания
+// результата запроса в Page
 func (r requester) Get(ctx context.Context, url string) (Page, error) {
 	select {
 	case <-ctx.Done():
